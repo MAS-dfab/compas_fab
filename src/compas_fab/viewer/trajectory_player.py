@@ -368,8 +368,6 @@ class TrajectoryPlayer:
         return Configuration(points[-1].joint_values, points[-1].joint_types, self.trajectory.joint_names)
 
     def _setup_scrubber(self):
-        """Creates a time-based UI slider and binds it to the animation loop."""
-
         if not self.trajectory or not self.trajectory.points:
             return
 
@@ -480,8 +478,8 @@ class TrajectoryPlayer:
                     self.viewer.transform(data['mesh'], T_object)
 
         print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s)")
-        slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.1, value=0.0, action=scrub_callback)
-        timeline = Timeline(total_time=total_time, step=0.1, value=0.0, action=scrub_callback)
+        # slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.01, value=0.0, action=scrub_callback)
+        timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
         
         self.viewer.add_ui_element(timeline)
         scrub_callback(0.0)
