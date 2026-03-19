@@ -1,4 +1,3 @@
-
 from compas.colors import Color
 from compas.datastructures import Mesh as CompasMesh
 from compas.geometry import Cylinder
