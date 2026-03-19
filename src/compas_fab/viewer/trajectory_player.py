@@ -13,6 +13,7 @@ try:
     from compas_threejs.materials import Material
     from compas_threejs.materials import PhysicalMaterial
     from compas_threejs.ui import Slider
+    from compas_threejs.ui import Timeline
     from compas_threejs.viewer import Viewer
     HAS_THREEJS = True
 except ImportError:
@@ -479,7 +480,8 @@ class TrajectoryPlayer:
                     self.viewer.transform(data['mesh'], T_object)
 
         print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s)")
-        slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.01, value=0.0, action=scrub_callback)
+        slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.1, value=0.0, action=scrub_callback)
+        timeline = Timeline(total_time=total_time, step=0.1, value=0.0, action=scrub_callback)
         
-        self.viewer.add_ui_element(slider)
+        self.viewer.add_ui_element(timeline)
         scrub_callback(0.0)
