@@ -129,6 +129,16 @@ class TrajectoryPlayer:
         """Helper to extract visuals from a kinematic model and load them into Three.js."""
         for link in model_to_parse.iter_links():
             unique_name = f"{name_prefix}{link.name}"
+            
+            if "tool" in unique_name:
+                pmaterial = PhysicalMaterial(color=Color(0.4, 0.4, 0.4))
+            elif "link" in unique_name:
+                pmaterial = PhysicalMaterial(color=Color(0.6, 0.6, 0.6))
+            elif "world" in unique_name:
+                pmaterial = PhysicalMaterial(color=Color(0.8, 0.8, 0.8), opacity=0.2)
+            else:
+                pmaterial = PhysicalMaterial(color=Color(0.9, 0.9, 0.9), opacity=0.9)
+                print(unique_name)
             self.link_id_map[unique_name] = []
             
             for visual in link.visual:
@@ -154,7 +164,7 @@ class TrajectoryPlayer:
                 
                 for item in meshes_to_add:
                     if item is not None:
-                        self.viewer.add_geometry(item)
+                        self.viewer.add_geometry(item, material=pmaterial)
                         self.link_id_map[unique_name].append({"geometry": item, "T_local": T_local})
 
     def _extract_robot(self):
@@ -186,7 +196,6 @@ class TrajectoryPlayer:
                     seen_guids.add(guid_str)
                     
                     self.viewer.add_geometry(item, material=PhysicalMaterial(color=Color(0.5, 0.5, 0.5)))
-                    self.viewer.add_geometry(item.copy(), material=PhysicalMaterial(color=Color(0.4, 0.4, 0.4), wireframe=True))
                     self.link_id_map[rb_name].append({"geometry": item, "T_local": Transformation()})
                     
                     if rb_state.frame:
