@@ -48,39 +48,31 @@ class TrajectoryPlayer:
         self.link_id_map = {}
         self.pnp_data = {"workpieces": {}}
         
-        # Extract the static scene upon initialization
         self._extract_robot()
         self._extract_tools()
         self._extract_rigid_bodies()
-
-        # if self.trajectory:
-        #     self._setup_scrubber()
 
     def add_dynamic_workpieces(self, pnp_data, geometry_dict):
         """Adds dynamic workpieces that attach and detach from the robot."""
 
         self.dynamic_workpieces = {}
         
-        # A matrix to banish the static ghosts
         T_shadow_realm = Translation.from_vector([0, 0, -100])
 
         for item_name, mesh in geometry_dict.items():
             if item_name in pnp_data:
-                # 1. Add to viewer (Wood material!)
                 wood_mat = PhysicalMaterial(color=Color(0.8, 0.6, 0.4), roughness=0.8, thickness=1.0)
                 self.viewer.add_geometry(mesh, wood_mat) 
                 
-                # 2. Store it for the animation loop
                 self.dynamic_workpieces[item_name] = {
                     'mesh': mesh,
                     'rules': pnp_data[item_name]
                 }
                 print(f"🪵 Added dynamic workpiece: {item_name}")
                 
-                # 3. 🔪 THE GHOST KILLER: Banish the static collision clone!
                 if item_name in self.link_id_map:
                     for mesh_data in self.link_id_map[item_name]:
-                        # Permanently move the static grey mesh underground
+                        # Permanently move the static grey mesh underground 
                         self.viewer.transform(mesh_data['geometry'], T_shadow_realm)
                         
             else:
@@ -121,7 +113,7 @@ class TrajectoryPlayer:
         
         if self.trajectory:
             self._setup_scrubber()
-            
+
         # Force the scrubber to frame 0 so it initializes in the correct position
         if self.trajectory and hasattr(self, '_scrub_callback'):
             self._scrub_callback([0])
@@ -220,12 +212,12 @@ class TrajectoryPlayer:
         robot_cell = self.robot_cell
         model = self.robot_cell.robot_model
 
-        # 1. AUTO-DEDUCE LINK NAME
+        # 1. LINK NAME
         self.triad_track_link = track_link_name
         if not self.triad_track_link:
             self.triad_track_link = robot_cell.get_end_effector_link_name(group=group)
 
-        # 2. AUTO-DEDUCE TCP OFFSET
+        # 2. TCP OFFSET
         if local_offset is not None:
             if isinstance(local_offset, Frame):
                 self.T_offset = Transformation.from_frame(local_offset)
@@ -253,7 +245,7 @@ class TrajectoryPlayer:
             T_tcp = T_flange * self.T_offset
             tcp_points.append(Frame.from_transformation(T_tcp).point)
 
-        # 4. Add the Gradient Trace (If requested)
+        # 4. Add the Gradient Trace
         if draw_trace and len(tcp_points) > 1:
             trace_line = Polyline(tcp_points)
             lines = trace_line.lines
@@ -265,7 +257,7 @@ class TrajectoryPlayer:
                 r, g, b = i / num_lines, 0.0, 1.0 - (i / num_lines)
                 self.viewer.add_geometry(line, LineMaterial(color=Color(r, g, b), opacity=0.5))
 
-        # 5. Add the Dynamic TCP Triad (If requested)
+        # 5. Add the Dynamic TCP Triad
         if draw_triad:
             base_cyl = Cylinder(0.005, 0.2)
             
@@ -290,10 +282,8 @@ class TrajectoryPlayer:
             print("⚠️ No trajectory points found for ghost!")
             return
 
-        # 1. Create the transparent material
         ghost_mat = Material(color=Color(*color), opacity=opacity)
 
-        # 2. Get the very last point in the trajectory
         final_point = self.trajectory.points[-1]
         final_cfg = Configuration(
             joint_values=final_point.joint_values,
@@ -304,7 +294,6 @@ class TrajectoryPlayer:
         full_config = self.cell_state.robot_configuration.merged(final_cfg)
         model = self.robot_cell.robot_model
 
-        # 3. Spawn Ghost Robot Links
         for link in model.iter_links():
             link_name = link.name
             if link_name in self.link_id_map and self.link_id_map[link_name]:
@@ -312,14 +301,10 @@ class TrajectoryPlayer:
                 T_link = Transformation.from_frame(link_frame)
                 
                 for mesh_data in self.link_id_map[link_name]:
-                    # Copy the base geometry so we don't accidentally move the real robot!
                     ghost_mesh = mesh_data['geometry'].copy()
                     ghost_mesh.transform(T_link * mesh_data['T_local'])
-                    
-                    # Pass material as a positional argument
                     self.viewer.add_geometry(ghost_mesh, ghost_mat)
 
-        # 4. Spawn Ghost Tool Links
         for tool_name, t_state in self.cell_state.tool_states.items():
             t_model = self.robot_cell.tool_models[tool_name]
             parent_link = t_model.connected_to
@@ -347,14 +332,12 @@ class TrajectoryPlayer:
         duration = point.time_from_start
         if duration is None:
             return 0.0
-        # The Duration object already calculates the total float for us!
         return duration.seconds
 
     def _get_interpolated_config(self, t):
         """Generates an exact robot Configuration for any given time 't'."""
         points = self.trajectory.points
 
-        # 1. Edge cases: Before start or after end
         if t <= 0.0:
             return Configuration(points[0].joint_values, points[0].joint_types, self.trajectory.joint_names)
         
@@ -362,7 +345,6 @@ class TrajectoryPlayer:
         if t >= total_time:
             return Configuration(points[-1].joint_values, points[-1].joint_types, self.trajectory.joint_names)
 
-        # 2. Find the correct time window and interpolate
         for i in range(len(points) - 1):
             t0 = self._get_time_in_seconds(points[i])
             t1 = self._get_time_in_seconds(points[i+1])
@@ -374,12 +356,10 @@ class TrajectoryPlayer:
                 vals0 = points[i].joint_values
                 vals1 = points[i+1].joint_values
                 
-                # Linearly mix the joint angles!
                 interp_vals = [v0 + ratio * (v1 - v0) for v0, v1 in zip(vals0, vals1)]
                 
                 return Configuration(interp_vals, points[i].joint_types, self.trajectory.joint_names)
         
-        # Fallback
         return Configuration(points[-1].joint_values, points[-1].joint_types, self.trajectory.joint_names)
     
     def _calculate_frame_transforms(self, t):
@@ -400,7 +380,7 @@ class TrajectoryPlayer:
                 for mesh_data in self.link_id_map[link_name]:
                     frame_transforms.append((mesh_data['geometry'], T_link * mesh_data['T_local']))
 
-        # 2. Update the Tools (This brings your gripper back!)
+        # 2. Update the Tools
         for tool_name, t_state in self.cell_state.tool_states.items():
             t_model = self.robot_cell.tool_models[tool_name]
             parent_link = t_model.connected_to
@@ -432,7 +412,6 @@ class TrajectoryPlayer:
         if hasattr(self, 'dynamic_workpieces') and self.dynamic_workpieces:
             track_link = getattr(self, 'triad_track_link', model.get_end_effector_link_name())
             
-            # Robustly find the Tool offset independent of the Triad!
             active_tool = next((t for t in self.robot_cell.tool_models.values() if t.connected_to == track_link), None)
             T_tool_offset = Transformation.from_frame(active_tool.frame) if active_tool and active_tool.frame else Transformation()
             
@@ -445,7 +424,6 @@ class TrajectoryPlayer:
                 detach_time = rules.get('detach_time', float('inf'))
                 T_grasp = rules.get('T_grasp', Transformation())
                 
-                # 1. Look for a Lumber Yard spot. Default to None!
                 T_park = rules.get('T_park', None) 
                 appear_time = rules.get('appear_time', 0.0)
                 vanish_delay = rules.get('vanish_delay', None)
@@ -455,32 +433,26 @@ class TrajectoryPlayer:
                 
                 if t < appear_time:
                     if T_park is not None:
-                        # 1. STOCK: Wait in the Lumber Yard until 3 seconds before pickup!
                         T_object = T_park
                     else:
-                        # 2. ELEMENTS: Hide underground until the Stock gets milled!
                         T_object = T_shadow_realm
                         
                 elif t < attach_time:
-                    # 3. DELIVERY TO CNC BED! 
                     cfg_pickup = self._get_interpolated_config(attach_time)
                     full_cfg_pickup = self.cell_state.robot_configuration.merged(cfg_pickup)
                     f_pickup = model.forward_kinematics(full_cfg_pickup, link_name=track_link)
                     T_object = Transformation.from_frame(f_pickup) * T_tool_offset * T_grasp
                     
                 elif vanish_delay is not None and t > (detach_time + vanish_delay):
-                    # 4. MILLED AWAY: The stock vanishes into the Shadow Realm!
                     T_object = T_shadow_realm
                     
                 elif t >= detach_time and detach_time != float('inf'):
-                    # 5. DROPPED OFF: Sitting on the machine or Assembly Table
                     cfg_drop = self._get_interpolated_config(detach_time)
                     full_cfg_drop = self.cell_state.robot_configuration.merged(cfg_drop)
                     f_drop = model.forward_kinematics(full_cfg_drop, link_name=track_link)
                     T_object = Transformation.from_frame(f_drop) * T_tool_offset * T_grasp
                     
                 else:
-                    # 6. IN TRANSIT: Attached to the gripper TCP!
                     T_object = T_flange * T_tool_offset * T_grasp
                     
                 frame_transforms.append((data['mesh'], T_object))
@@ -494,7 +466,7 @@ class TrajectoryPlayer:
         total_time = self._get_time_in_seconds(self.trajectory.points[-1])
 
         # ==========================================
-        # PATH A: CACHED PLAYBACK (Smooth, slow load)
+        # PATH A: CACHED PLAYBACK
         # ==========================================
         if getattr(self, 'use_cache', False):
             step_size = self.cache_step
@@ -505,7 +477,6 @@ class TrajectoryPlayer:
             
             while current_t <= total_time + step_size:
                 t = min(current_t, total_time)
-                # Call our pure math engine and save the results
                 self.frame_cache[round(t, 2)] = self._calculate_frame_transforms(t)
                 
                 if t == total_time: 
@@ -527,18 +498,16 @@ class TrajectoryPlayer:
                         self.viewer.transform(mesh, T)
 
         # ==========================================
-        # PATH B: LIVE PLAYBACK (Instant load, network bound)
+        # PATH B: LIVE PLAYBACK
         # ==========================================
         else:
             def scrub_callback(t_value):
                 t = t_value[0] if isinstance(t_value, list) else t_value
                 
-                # Calculate live, and apply instantly
                 transforms = self._calculate_frame_transforms(t)
                 for mesh, T in transforms:
                     self.viewer.transform(mesh, T)
 
-        # --- CREATE THE TIMELINE ---
         mode_str = "Cached" if getattr(self, 'use_cache', False) else "Live"
         print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s, Mode: {mode_str})")
         
@@ -546,7 +515,6 @@ class TrajectoryPlayer:
         timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
         self.viewer.add_ui_element(timeline)
         
-        # Trigger the first frame
         scrub_callback(0.0)
 
     # def _setup_scrubber(self):
