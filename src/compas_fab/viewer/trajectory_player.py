@@ -138,7 +138,6 @@ class TrajectoryPlayer:
                 pmaterial = PhysicalMaterial(color=Color(0.8, 0.8, 0.8), opacity=0.2)
             else:
                 pmaterial = PhysicalMaterial(color=Color(0.9, 0.9, 0.9), opacity=0.9)
-                print(unique_name)
             self.link_id_map[unique_name] = []
             
             for visual in link.visual:
