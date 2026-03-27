@@ -33,7 +33,7 @@ class TrajectoryPlayer:
         The initial state of the robot cell. If not provided, the default state is used.
     """
 
-    def __init__(self, robot_cell, trajectory=None, cell_state=None):
+    def __init__(self, robot_cell, trajectory=None, cell_state=None, use_cache=False, cache_fps=20):
         if not HAS_THREEJS:
             raise ImportError("The 'compas_threejs' package is required to use the TrajectoryPlayer.")
 
@@ -41,6 +41,9 @@ class TrajectoryPlayer:
         self.robot_cell = robot_cell
         self.trajectory = trajectory
         self.cell_state = cell_state or robot_cell.default_cell_state
+
+        self.use_cache = use_cache
+        self.cache_step = 1.0 / cache_fps if cache_fps > 0 else 0.05
         
         self.link_id_map = {}
         self.pnp_data = {"workpieces": {}}
@@ -50,8 +53,8 @@ class TrajectoryPlayer:
         self._extract_tools()
         self._extract_rigid_bodies()
 
-        if self.trajectory:
-            self._setup_scrubber()
+        # if self.trajectory:
+        #     self._setup_scrubber()
 
     def add_dynamic_workpieces(self, pnp_data, geometry_dict):
         """Adds dynamic workpieces that attach and detach from the robot."""
@@ -115,6 +118,10 @@ class TrajectoryPlayer:
 
     def show(self):
         """Starts the local web server and opens the viewer in the browser."""
+        
+        if self.trajectory:
+            self._setup_scrubber()
+            
         # Force the scrubber to frame 0 so it initializes in the correct position
         if self.trajectory and hasattr(self, '_scrub_callback'):
             self._scrub_callback([0])
@@ -374,120 +381,287 @@ class TrajectoryPlayer:
         
         # Fallback
         return Configuration(points[-1].joint_values, points[-1].joint_types, self.trajectory.joint_names)
+    
+    def _calculate_frame_transforms(self, t):
+        """Pure math engine. Returns a list of (mesh, Transformation) tuples for a given time."""
+        frame_transforms = []
+        
+        interp_cfg = self._get_interpolated_config(t)
+        full_config = self.cell_state.robot_configuration.merged(interp_cfg)
+        model = self.robot_cell.robot_model
 
+        # 1. Update the Robot
+        for link in model.iter_links():
+            link_name = link.name
+            if link_name in self.link_id_map and self.link_id_map[link_name]:
+                link_frame = model.forward_kinematics(full_config, link_name=link_name)
+                T_link = Transformation.from_frame(link_frame)
+                
+                for mesh_data in self.link_id_map[link_name]:
+                    frame_transforms.append((mesh_data['geometry'], T_link * mesh_data['T_local']))
+
+        # 2. Update the Tools (This brings your gripper back!)
+        for tool_name, t_state in self.cell_state.tool_states.items():
+            t_model = self.robot_cell.tool_models[tool_name]
+            parent_link = t_model.connected_to
+            
+            parent_frame = model.forward_kinematics(full_config, link_name=parent_link)
+            T_parent = Transformation.from_frame(parent_frame)
+            T_attach = Transformation.from_frame(t_state.attachment_frame) if t_state.attachment_frame else Transformation()
+            
+            for t_link in t_model.iter_links():
+                unique_name = f"{tool_name}_{t_link.name}"
+                if unique_name in self.link_id_map:
+                    t_link_frame = t_model.forward_kinematics(full_config, link_name=t_link.name)
+                    T_t_link = Transformation.from_frame(t_link_frame)
+                    T_final = T_parent * T_attach * T_t_link
+                    
+                    for mesh_data in self.link_id_map[unique_name]:
+                        frame_transforms.append((mesh_data['geometry'], T_final * mesh_data['T_local']))
+
+        # 3. Update TCP Triad
+        if hasattr(self, 'triad_objects') and self.triad_objects and hasattr(self, 'triad_track_link'):
+            flange_frame = model.forward_kinematics(full_config, link_name=self.triad_track_link)
+            T_flange = Transformation.from_frame(flange_frame)
+            T_tcp = T_flange * getattr(self, 'T_offset', Transformation())
+            
+            for mesh in self.triad_objects:
+                frame_transforms.append((mesh, T_tcp))
+
+        # 4. Update Dynamic Workpieces
+        if hasattr(self, 'dynamic_workpieces') and self.dynamic_workpieces:
+            track_link = getattr(self, 'triad_track_link', model.get_end_effector_link_name())
+            
+            # Robustly find the Tool offset independent of the Triad!
+            active_tool = next((t for t in self.robot_cell.tool_models.values() if t.connected_to == track_link), None)
+            T_tool_offset = Transformation.from_frame(active_tool.frame) if active_tool and active_tool.frame else Transformation()
+            
+            flange_frame = model.forward_kinematics(full_config, link_name=track_link)
+            T_flange = Transformation.from_frame(flange_frame)
+
+            for name, data in self.dynamic_workpieces.items():
+                rules = data['rules']
+                attach_time = rules.get('attach_time', -1.0)
+                detach_time = rules.get('detach_time', float('inf'))
+                T_grasp = rules.get('T_grasp', Transformation())
+                
+                # 1. Look for a Lumber Yard spot. Default to None!
+                T_park = rules.get('T_park', None) 
+                appear_time = rules.get('appear_time', 0.0)
+                vanish_delay = rules.get('vanish_delay', None)
+                
+                from compas.geometry import Translation
+                T_shadow_realm = Translation.from_vector([0, 0, -100])
+                
+                if t < appear_time:
+                    if T_park is not None:
+                        # 1. STOCK: Wait in the Lumber Yard until 3 seconds before pickup!
+                        T_object = T_park
+                    else:
+                        # 2. ELEMENTS: Hide underground until the Stock gets milled!
+                        T_object = T_shadow_realm
+                        
+                elif t < attach_time:
+                    # 3. DELIVERY TO CNC BED! 
+                    cfg_pickup = self._get_interpolated_config(attach_time)
+                    full_cfg_pickup = self.cell_state.robot_configuration.merged(cfg_pickup)
+                    f_pickup = model.forward_kinematics(full_cfg_pickup, link_name=track_link)
+                    T_object = Transformation.from_frame(f_pickup) * T_tool_offset * T_grasp
+                    
+                elif vanish_delay is not None and t > (detach_time + vanish_delay):
+                    # 4. MILLED AWAY: The stock vanishes into the Shadow Realm!
+                    T_object = T_shadow_realm
+                    
+                elif t >= detach_time and detach_time != float('inf'):
+                    # 5. DROPPED OFF: Sitting on the machine or Assembly Table
+                    cfg_drop = self._get_interpolated_config(detach_time)
+                    full_cfg_drop = self.cell_state.robot_configuration.merged(cfg_drop)
+                    f_drop = model.forward_kinematics(full_cfg_drop, link_name=track_link)
+                    T_object = Transformation.from_frame(f_drop) * T_tool_offset * T_grasp
+                    
+                else:
+                    # 6. IN TRANSIT: Attached to the gripper TCP!
+                    T_object = T_flange * T_tool_offset * T_grasp
+                    
+                frame_transforms.append((data['mesh'], T_object))
+
+        return frame_transforms
+    
     def _setup_scrubber(self):
         if not self.trajectory or not self.trajectory.points:
             return
 
         total_time = self._get_time_in_seconds(self.trajectory.points[-1])
-        model = self.robot_cell.robot_model
 
-        def scrub_callback(t_value):
-            t = t_value[0] if isinstance(t_value, list) else t_value
+        # ==========================================
+        # PATH A: CACHED PLAYBACK (Smooth, slow load)
+        # ==========================================
+        if getattr(self, 'use_cache', False):
+            step_size = self.cache_step
+            print(f"🧠 Pre-calculating {int(total_time / step_size)} animation frames... please wait...")
+            
+            self.frame_cache = {}
+            current_t = 0.0
+            
+            while current_t <= total_time + step_size:
+                t = min(current_t, total_time)
+                # Call our pure math engine and save the results
+                self.frame_cache[round(t, 2)] = self._calculate_frame_transforms(t)
+                
+                if t == total_time: 
+                    break
+                current_t += step_size
+                
+            print("✅ Cache built! Ready for instant playback.")
 
-            interp_cfg = self._get_interpolated_config(t)
-            full_config = self.cell_state.robot_configuration.merged(interp_cfg)
-
-            # 1. Update the Robot
-            for link in model.iter_links():
-                link_name = link.name
-                if link_name in self.link_id_map and self.link_id_map[link_name]:
-                    link_frame = model.forward_kinematics(full_config, link_name=link_name)
-                    T_link = Transformation.from_frame(link_frame)
+            def scrub_callback(t_value):
+                t_req = t_value[0] if isinstance(t_value, list) else t_value
+                t_rounded = round(round(t_req / step_size) * step_size, 2)
+                
+                if t_rounded > round(total_time, 2):
+                    t_rounded = round(round(total_time / step_size) * step_size, 2)
                     
-                    for mesh_data in self.link_id_map[link_name]:
-                        self.viewer.transform(mesh_data['geometry'], T_link * mesh_data['T_local'])
+                cached_transforms = self.frame_cache.get(t_rounded)
+                if cached_transforms:
+                    for mesh, T in cached_transforms:
+                        self.viewer.transform(mesh, T)
 
-            # 2. Update the Tools (This brings your gripper back!)
-            for tool_name, t_state in self.cell_state.tool_states.items():
-                t_model = self.robot_cell.tool_models[tool_name]
-                parent_link = t_model.connected_to
+        # ==========================================
+        # PATH B: LIVE PLAYBACK (Instant load, network bound)
+        # ==========================================
+        else:
+            def scrub_callback(t_value):
+                t = t_value[0] if isinstance(t_value, list) else t_value
                 
-                parent_frame = model.forward_kinematics(full_config, link_name=parent_link)
-                T_parent = Transformation.from_frame(parent_frame)
-                T_attach = Transformation.from_frame(t_state.attachment_frame) if t_state.attachment_frame else Transformation()
-                
-                for t_link in t_model.iter_links():
-                    unique_name = f"{tool_name}_{t_link.name}"
-                    if unique_name in self.link_id_map:
-                        t_link_frame = t_model.forward_kinematics(full_config, link_name=t_link.name)
-                        T_t_link = Transformation.from_frame(t_link_frame)
-                        T_final = T_parent * T_attach * T_t_link
-                        
-                        for mesh_data in self.link_id_map[unique_name]:
-                            self.viewer.transform(mesh_data['geometry'], T_final * mesh_data['T_local'])
+                # Calculate live, and apply instantly
+                transforms = self._calculate_frame_transforms(t)
+                for mesh, T in transforms:
+                    self.viewer.transform(mesh, T)
 
-            # 3. Update TCP Triad
-            if hasattr(self, 'triad_objects') and self.triad_objects and hasattr(self, 'triad_track_link'):
-                flange_frame = model.forward_kinematics(full_config, link_name=self.triad_track_link)
-                T_flange = Transformation.from_frame(flange_frame)
-                T_tcp = T_flange * getattr(self, 'T_offset', Transformation())
-                
-                for mesh in self.triad_objects:
-                    self.viewer.transform(mesh, T_tcp)
-
-            # 4. Update Dynamic Workpieces
-            if hasattr(self, 'dynamic_workpieces') and self.dynamic_workpieces:
-                track_link = getattr(self, 'triad_track_link', model.get_end_effector_link_name())
-                
-                # Robustly find the Tool offset independent of the Triad!
-                active_tool = next((t for t in self.robot_cell.tool_models.values() if t.connected_to == track_link), None)
-                T_tool_offset = Transformation.from_frame(active_tool.frame) if active_tool and active_tool.frame else Transformation()
-                
-                flange_frame = model.forward_kinematics(full_config, link_name=track_link)
-                T_flange = Transformation.from_frame(flange_frame)
-
-                for name, data in self.dynamic_workpieces.items():
-                    rules = data['rules']
-                    attach_time = rules.get('attach_time', -1.0)
-                    detach_time = rules.get('detach_time', float('inf'))
-                    T_grasp = rules.get('T_grasp', Transformation())
-                    
-                    # 1. Look for a Lumber Yard spot. Default to None!
-                    T_park = rules.get('T_park', None) 
-                    appear_time = rules.get('appear_time', 0.0)
-                    vanish_delay = rules.get('vanish_delay', None)
-                    
-                    from compas.geometry import Translation
-                    T_shadow_realm = Translation.from_vector([0, 0, -100])
-                    
-                    if t < appear_time:
-                        if T_park is not None:
-                            # 1. STOCK: Wait in the Lumber Yard until 3 seconds before pickup!
-                            T_object = T_park
-                        else:
-                            # 2. ELEMENTS: Hide underground until the Stock gets milled!
-                            T_object = T_shadow_realm
-                            
-                    elif t < attach_time:
-                        # 3. DELIVERY TO CNC BED! 
-                        # (Stock arrives 3s early. Elements appear exactly when milled).
-                        cfg_pickup = self._get_interpolated_config(attach_time)
-                        full_cfg_pickup = self.cell_state.robot_configuration.merged(cfg_pickup)
-                        f_pickup = model.forward_kinematics(full_cfg_pickup, link_name=track_link)
-                        T_object = Transformation.from_frame(f_pickup) * T_tool_offset * T_grasp
-                        
-                    elif vanish_delay is not None and t > (detach_time + vanish_delay):
-                        # 4. MILLED AWAY: The stock vanishes into the Shadow Realm!
-                        T_object = T_shadow_realm
-                        
-                    elif t >= detach_time and detach_time != float('inf'):
-                        # 5. DROPPED OFF: Sitting on the machine or Assembly Table
-                        cfg_drop = self._get_interpolated_config(detach_time)
-                        full_cfg_drop = self.cell_state.robot_configuration.merged(cfg_drop)
-                        f_drop = model.forward_kinematics(full_cfg_drop, link_name=track_link)
-                        T_object = Transformation.from_frame(f_drop) * T_tool_offset * T_grasp
-                        
-                    else:
-                        # 6. IN TRANSIT: Attached to the gripper TCP!
-                        T_object = T_flange * T_tool_offset * T_grasp
-                        
-                    # Apply the calculated transformation to the Three.js mesh
-                    self.viewer.transform(data['mesh'], T_object)
-
-        print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s)")
-        # slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.01, value=0.0, action=scrub_callback)
-        timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
+        # --- CREATE THE TIMELINE ---
+        mode_str = "Cached" if getattr(self, 'use_cache', False) else "Live"
+        print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s, Mode: {mode_str})")
         
+        from compas_threejs.ui import Timeline
+        timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
         self.viewer.add_ui_element(timeline)
+        
+        # Trigger the first frame
         scrub_callback(0.0)
+
+    # def _setup_scrubber(self):
+    #     if not self.trajectory or not self.trajectory.points:
+    #         return
+
+    #     total_time = self._get_time_in_seconds(self.trajectory.points[-1])
+    #     model = self.robot_cell.robot_model
+
+    #     def scrub_callback(t_value):
+    #         t = t_value[0] if isinstance(t_value, list) else t_value
+
+    #         interp_cfg = self._get_interpolated_config(t)
+    #         full_config = self.cell_state.robot_configuration.merged(interp_cfg)
+
+    #         # 1. Update the Robot
+    #         for link in model.iter_links():
+    #             link_name = link.name
+    #             if link_name in self.link_id_map and self.link_id_map[link_name]:
+    #                 link_frame = model.forward_kinematics(full_config, link_name=link_name)
+    #                 T_link = Transformation.from_frame(link_frame)
+                    
+    #                 for mesh_data in self.link_id_map[link_name]:
+    #                     self.viewer.transform(mesh_data['geometry'], T_link * mesh_data['T_local'])
+
+    #         # 2. Update the Tools (This brings your gripper back!)
+    #         for tool_name, t_state in self.cell_state.tool_states.items():
+    #             t_model = self.robot_cell.tool_models[tool_name]
+    #             parent_link = t_model.connected_to
+                
+    #             parent_frame = model.forward_kinematics(full_config, link_name=parent_link)
+    #             T_parent = Transformation.from_frame(parent_frame)
+    #             T_attach = Transformation.from_frame(t_state.attachment_frame) if t_state.attachment_frame else Transformation()
+                
+    #             for t_link in t_model.iter_links():
+    #                 unique_name = f"{tool_name}_{t_link.name}"
+    #                 if unique_name in self.link_id_map:
+    #                     t_link_frame = t_model.forward_kinematics(full_config, link_name=t_link.name)
+    #                     T_t_link = Transformation.from_frame(t_link_frame)
+    #                     T_final = T_parent * T_attach * T_t_link
+                        
+    #                     for mesh_data in self.link_id_map[unique_name]:
+    #                         self.viewer.transform(mesh_data['geometry'], T_final * mesh_data['T_local'])
+
+    #         # 3. Update TCP Triad
+    #         if hasattr(self, 'triad_objects') and self.triad_objects and hasattr(self, 'triad_track_link'):
+    #             flange_frame = model.forward_kinematics(full_config, link_name=self.triad_track_link)
+    #             T_flange = Transformation.from_frame(flange_frame)
+    #             T_tcp = T_flange * getattr(self, 'T_offset', Transformation())
+                
+    #             for mesh in self.triad_objects:
+    #                 self.viewer.transform(mesh, T_tcp)
+
+    #         # 4. Update Dynamic Workpieces
+    #         if hasattr(self, 'dynamic_workpieces') and self.dynamic_workpieces:
+    #             track_link = getattr(self, 'triad_track_link', model.get_end_effector_link_name())
+                
+    #             # Robustly find the Tool offset independent of the Triad!
+    #             active_tool = next((t for t in self.robot_cell.tool_models.values() if t.connected_to == track_link), None)
+    #             T_tool_offset = Transformation.from_frame(active_tool.frame) if active_tool and active_tool.frame else Transformation()
+                
+    #             flange_frame = model.forward_kinematics(full_config, link_name=track_link)
+    #             T_flange = Transformation.from_frame(flange_frame)
+
+    #             for name, data in self.dynamic_workpieces.items():
+    #                 rules = data['rules']
+    #                 attach_time = rules.get('attach_time', -1.0)
+    #                 detach_time = rules.get('detach_time', float('inf'))
+    #                 T_grasp = rules.get('T_grasp', Transformation())
+                    
+    #                 # 1. Look for a Lumber Yard spot. Default to None!
+    #                 T_park = rules.get('T_park', None) 
+    #                 appear_time = rules.get('appear_time', 0.0)
+    #                 vanish_delay = rules.get('vanish_delay', None)
+                    
+    #                 from compas.geometry import Translation
+    #                 T_shadow_realm = Translation.from_vector([0, 0, -100])
+                    
+    #                 if t < appear_time:
+    #                     if T_park is not None:
+    #                         # 1. STOCK: Wait in the Lumber Yard until 3 seconds before pickup!
+    #                         T_object = T_park
+    #                     else:
+    #                         # 2. ELEMENTS: Hide underground until the Stock gets milled!
+    #                         T_object = T_shadow_realm
+                            
+    #                 elif t < attach_time:
+    #                     # 3. DELIVERY TO CNC BED! 
+    #                     # (Stock arrives 3s early. Elements appear exactly when milled).
+    #                     cfg_pickup = self._get_interpolated_config(attach_time)
+    #                     full_cfg_pickup = self.cell_state.robot_configuration.merged(cfg_pickup)
+    #                     f_pickup = model.forward_kinematics(full_cfg_pickup, link_name=track_link)
+    #                     T_object = Transformation.from_frame(f_pickup) * T_tool_offset * T_grasp
+                        
+    #                 elif vanish_delay is not None and t > (detach_time + vanish_delay):
+    #                     # 4. MILLED AWAY: The stock vanishes into the Shadow Realm!
+    #                     T_object = T_shadow_realm
+                        
+    #                 elif t >= detach_time and detach_time != float('inf'):
+    #                     # 5. DROPPED OFF: Sitting on the machine or Assembly Table
+    #                     cfg_drop = self._get_interpolated_config(detach_time)
+    #                     full_cfg_drop = self.cell_state.robot_configuration.merged(cfg_drop)
+    #                     f_drop = model.forward_kinematics(full_cfg_drop, link_name=track_link)
+    #                     T_object = Transformation.from_frame(f_drop) * T_tool_offset * T_grasp
+                        
+    #                 else:
+    #                     # 6. IN TRANSIT: Attached to the gripper TCP!
+    #                     T_object = T_flange * T_tool_offset * T_grasp
+                        
+    #                 # Apply the calculated transformation to the Three.js mesh
+    #                 self.viewer.transform(data['mesh'], T_object)
+
+    #     print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s)")
+    #     # slider = Slider(title="Time (s)", min=0.0, max=total_time, step=0.01, value=0.0, action=scrub_callback)
+    #     timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
+        
+    #     self.viewer.add_ui_element(timeline)
+    #     scrub_callback(0.0)
