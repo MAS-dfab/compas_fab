@@ -1,3 +1,8 @@
+# from compas_fab.robots import JointTrajectory
+# from compas_fab.robots.time_ import Duration
+
+from core.utils import combine_trajectories
+
 from compas.colors import Color
 from compas.datastructures import Mesh as CompasMesh
 from compas.geometry import Cylinder
@@ -27,20 +32,24 @@ class TrajectoryPlayer:
     ----------
     robot_cell : :class:`compas_fab.robots.RobotCell`
         The robot cell to visualize.
-    trajectory : :class:`compas_fab.robots.JointTrajectory`, optional
-        The trajectory to play back.
+    trajectory_planner : :class:`compas_fab.robots.TrajectoryPlanner`
+        The trajectory planner to use.
     cell_state : :class:`compas_fab.robots.RobotCellState`, optional
         The initial state of the robot cell. If not provided, the default state is used.
     """
 
-    def __init__(self, robot_cell, trajectory=None, cell_state=None, use_cache=False, cache_fps=20):
+    def __init__(self, trajectory_planner, timber_model, beams, use_cache=False, cache_fps=20):
         if not HAS_THREEJS:
             raise ImportError("The 'compas_threejs' package is required to use the TrajectoryPlayer.")
 
         self.viewer = Viewer()
-        self.robot_cell = robot_cell
-        self.trajectory = trajectory
-        self.cell_state = cell_state or robot_cell.default_cell_state
+        self.trajectory_planner = trajectory_planner
+        self.robot_cell = trajectory_planner.robot_cell
+        self.cell_state = trajectory_planner.state
+
+        self.timber_model = timber_model
+        self.beams = beams
+        self.trajectory = None
 
         self.use_cache = use_cache
         self.cache_step = 1.0 / cache_fps if cache_fps > 0 else 0.05
@@ -108,9 +117,90 @@ class TrajectoryPlayer:
         if ghost:
             self.add_target_ghost()
 
+    def setup_ui(self):
+        """Sets up the UI elements for trajectory playback."""
+        if not self.beams:
+            print("⚠️ No beams provided for UI setup!")
+            return
+
+        max_beam_index = len(self.beams) - 1
+
+        beam_slider = Slider(
+            title="Select Beam Sequence",
+            min=0,
+            max=max_beam_index,
+            step=1,
+            value=0,
+            action=self.on_beam_selected
+        )
+
+        self.viewer.add_ui_element(beam_slider)
+        print("🎛️ UI setup complete with beam selection slider.")
+
+    def on_beam_selected(self, value):
+        """Callback for when a beam is selected from the UI slider."""
+        beam_index = int(value)
+        current_beam = (self.beams)[beam_index]
+        print(f"🔨 Beam {beam_index} selected: {current_beam.guid}")
+
+        self._cleanup_previous_run()
+
+        assembled_elements = []
+        for p in self.timber_model.plates:
+            p_mesh = p.elementgeometry.transformed(self.trajectory_planner.at_T).to_viewmesh()[0]
+            assembled_elements.append(p_mesh)
+        for b in (self.beams)[:beam_index]:
+            b_mesh = b.geometry.transformed(self.trajectory_planner.at_T*b.attributes.get("parent_T")).to_viewmesh()[0]
+            assembled_elements.append(b_mesh)
+
+        self.trajectory_planner.add_rb_to_cell(meshes=assembled_elements, name="assembled_elements")
+        self._draw_assembled_elements(assembled_elements)
+
+        if hasattr(self.trajectory_planner, 'workpiece_manager'):
+            wm = self.trajectory_planner.workpiece_manager
+            wm.rules.clear()
+            wm.meshes.clear()
+            wm.latest_stock_vanish_time = 0.0
+            wm.lumber_yard_stock_y = 0.0
+
+        if hasattr(self.trajectory_planner, 'trajectory_list'):
+            self.trajectory_planner.trajectory_list = []
+            
+        if hasattr(self.trajectory_planner, 'current_time'):
+            self.trajectory_planner.current_time = 0.0
+            
+        if hasattr(self.trajectory_planner, 'planned_time'):
+            self.trajectory_planner.planned_time = 0.0
+            
+        element_trajectories = self.trajectory_planner.pick_and_place_element(str(current_beam.guid), self.timber_model)
+
+        self.trajectory = combine_trajectories(element_trajectories)
+
+        self.add_dynamic_workpieces(
+            pnp_data=self.trajectory_planner.workpiece_manager.rules, 
+            geometry_dict=self.trajectory_planner.workpiece_manager.meshes
+        )
+        
+        self.add_visual_helpers(
+            trace=True, 
+            triad=True, 
+            ghost=False,
+            group=self.trajectory_planner.group
+        )
+
+        if self.trajectory:
+            self._setup_scrubber()
+
+        if self.trajectory and hasattr(self, '_scrub_callback'):
+            self._scrub_callback([0])
+
+        # self.viewer.update()
+
     def show(self):
         """Starts the local web server and opens the viewer in the browser."""
         
+        self.setup_ui()
+
         if self.trajectory:
             self._setup_scrubber()
 
@@ -174,21 +264,26 @@ class TrajectoryPlayer:
 
     def _extract_rigid_bodies(self):
         for rb_name, rb_model in self.robot_cell.rigid_body_models.items():
+            print(rb_name, rb_model)
             self.link_id_map[rb_name] = []
             rb_state = self.cell_state.rigid_body_states[rb_name]
             meshes_to_add = []
             
             if hasattr(rb_model, 'visual_meshes') and rb_model.visual_meshes:
+                print("visual_meshes found for", rb_name)
                 for wrapped_item in rb_model.visual_meshes:
                     if hasattr(wrapped_item, 'mesh'): meshes_to_add.append(wrapped_item.mesh)
                     elif hasattr(wrapped_item, 'geometry'): meshes_to_add.append(wrapped_item.geometry)
                     else: meshes_to_add.append(wrapped_item)
             elif hasattr(rb_model, 'mesh') and rb_model.mesh:
+                print("mesh found for", rb_name)
                 meshes_to_add.append(rb_model.mesh)
                             
             seen_guids = set()
             for item in meshes_to_add:
+                print("Adding rigid body geometry for", rb_name, "with item:", item)
                 if item is not None and hasattr(item, 'guid'):
+                    print("Item GUID:", item.guid)
                     guid_str = str(item.guid)
                     if guid_str in seen_guids: continue
                     seen_guids.add(guid_str)
@@ -247,15 +342,37 @@ class TrajectoryPlayer:
 
         # 4. Add the Gradient Trace
         if draw_trace and len(tcp_points) > 1:
+            self.trace_objects = getattr(self, 'trace_objects', [])
             trace_line = Polyline(tcp_points)
             lines = trace_line.lines
             num_lines = len(lines)
             
             for i, line in enumerate(lines):
-                if line.length < 0.0001:
+                length = line.length
+                if length < 0.0001:
                     continue 
+
+                # 1. Create a thin cylinder (2mm radius) centered at the origin
+                cyl_shape = Cylinder(0.002, length) 
+                trace_mesh = CompasMesh.from_shape(cyl_shape)
+
+                # 2. Mathematically orient the cylinder to perfectly match the line segment
+                z_axis = line.vector.unitized()
+                if abs(z_axis.z) < 0.99:
+                    x_axis = z_axis.cross([0, 0, 1]).unitized()
+                else:
+                    x_axis = z_axis.cross([0, 1, 0]).unitized()
+                y_axis = z_axis.cross(x_axis).unitized()
+
+                target_frame = Frame(line.midpoint, x_axis, y_axis)
+                trace_mesh.transform(Transformation.from_frame(target_frame))
+
+                # 3. Apply your beautiful gradient and send it to the viewer
                 r, g, b = i / num_lines, 0.0, 1.0 - (i / num_lines)
-                self.viewer.add_geometry(line, LineMaterial(color=Color(r, g, b), opacity=0.5))
+                mat = PhysicalMaterial(color=Color(r, g, b))
+                
+                self.viewer.add_geometry(trace_mesh, mat)
+                self.trace_objects.append(trace_mesh)
 
         # 5. Add the Dynamic TCP Triad
         if draw_triad:
@@ -281,7 +398,8 @@ class TrajectoryPlayer:
         if not self.trajectory or not self.trajectory.points:
             print("⚠️ No trajectory points found for ghost!")
             return
-
+        
+        self.ghost_objects = getattr(self, 'ghost_objects', [])
         ghost_mat = Material(color=Color(*color), opacity=opacity)
 
         final_point = self.trajectory.points[-1]
@@ -322,6 +440,68 @@ class TrajectoryPlayer:
                         ghost_tool_mesh.transform(T_final)
                         
                         self.viewer.add_geometry(ghost_tool_mesh, ghost_mat)
+                        self.ghost_objects.append(ghost_mesh)
+
+    def _cleanup_previous_run(self):
+        """Completely removes old geometries from the Three.js scene."""
+
+        # 1. REMOVE old assembled elements
+        if hasattr(self, 'assembled_objects'):
+            for mesh in self.assembled_objects:
+                self._hide_and_remove(mesh)
+            self.assembled_objects = []
+                
+        # 2. REMOVE and CLEAR old workpieces
+        if hasattr(self, 'dynamic_workpieces'):
+            for data in self.dynamic_workpieces.values():
+                self._hide_and_remove(data['mesh'])
+            self.dynamic_workpieces = {} 
+                
+        # 3. REMOVE old TCP triad
+        if hasattr(self, 'triad_objects'):
+            for mesh in self.triad_objects:
+                self._hide_and_remove(mesh)
+            self.triad_objects = []
+
+        # 4. REMOVE old traces
+        if hasattr(self, 'trace_objects'):
+            for line in self.trace_objects:
+                self._hide_and_remove(line)
+            self.trace_objects = []
+
+        # 5. REMOVE old ghosts
+        if hasattr(self, 'ghost_objects'):
+            for mesh in self.ghost_objects:
+                self._hide_and_remove(mesh)
+            self.ghost_objects = []
+
+    def _draw_assembled_elements(self, meshes):
+        """Adds the newly calculated assembled elements to the frontend viewer."""
+        self.assembled_objects = getattr(self, 'assembled_objects', [])
+        
+        wood_mat = PhysicalMaterial(color=Color(0.5, 0.5, 0.5)) # Gray for already assembled
+        
+        for mesh in meshes:
+            self.viewer.add_geometry(mesh, material=wood_mat)
+            self.assembled_objects.append(mesh)
+
+    def _hide_and_remove(self, obj):
+        """A bulletproof method to remove objects from the Three.js canvas."""
+        if not obj: return
+        
+        # 1. GOLD STANDARD: Use your new direct websocket dispatch via GUID
+        try:
+            self.viewer.remove_object(obj)
+        except Exception:
+            pass
+
+        # 2. FALLBACK: Teleport to the shadow realm
+        try:
+            self.viewer.transform(obj, Translation.from_vector([0, 0, -10000]))
+            if hasattr(obj, 'visible'):
+                obj.visible = False
+        except Exception: 
+            pass
 
     # --------------------------------------------------------------------------
     # Scrubber Logic
@@ -428,7 +608,6 @@ class TrajectoryPlayer:
                 appear_time = rules.get('appear_time', 0.0)
                 vanish_delay = rules.get('vanish_delay', None)
                 
-                from compas.geometry import Translation
                 T_shadow_realm = Translation.from_vector([0, 0, -100])
                 
                 if t < appear_time:
@@ -511,11 +690,72 @@ class TrajectoryPlayer:
         mode_str = "Cached" if getattr(self, 'use_cache', False) else "Live"
         print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s, Mode: {mode_str})")
         
-        from compas_threejs.ui import Timeline
         timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
         self.viewer.add_ui_element(timeline)
         
         scrub_callback(0.0)
+
+# def combine_trajectories(trajectories: list[JointTrajectory]) -> JointTrajectory:
+#     """
+#     Combines a list of sequential trajectories into one.
+
+#     This function correctly recalculates the time_from_start
+#     for each point and handles potential None values in planning_time
+#     and fraction.
+#     """
+#     if not trajectories:
+#         return JointTrajectory()
+
+#     first_traj = trajectories[0]
+#     combined_points = []
+#     combined_joint_names = first_traj.joint_names
+#     combined_start_config = first_traj.start_configuration
+
+#     total_planning_time = 0.0
+#     time_offset = Duration(0, 0)
+#     all_fractions_complete = True
+
+#     for traj in trajectories:
+#         if not traj.points:
+#             continue
+
+#         if traj.joint_names != combined_joint_names:
+#             raise ValueError("Cannot combine trajectories with different joint_names.")
+
+#         segment_duration = traj.points[-1].time_from_start
+
+#         for point in traj.points:
+#             new_point = point.copy()
+
+#             new_secs = time_offset.secs + new_point.time_from_start.secs
+#             new_nsecs = time_offset.nsecs + new_point.time_from_start.nsecs
+
+#             new_point.time_from_start = Duration(new_secs, new_nsecs)
+
+#             combined_points.append(new_point)
+
+#         new_offset_secs = time_offset.secs + segment_duration.secs
+#         new_offset_nsecs = time_offset.nsecs + segment_duration.nsecs
+#         time_offset = Duration(new_offset_secs, new_offset_nsecs)
+
+#         if traj.planning_time is not None:
+#             total_planning_time += traj.planning_time
+
+#         if traj.fraction is None or traj.fraction < 1.0:
+#             all_fractions_complete = False
+
+#     combined_trajectory = JointTrajectory(
+#         trajectory_points=combined_points, 
+#         joint_names=combined_joint_names, 
+#         start_configuration=combined_start_config, 
+#         attributes=first_traj.attributes.copy()
+#     )
+
+#     combined_trajectory.planning_time = total_planning_time
+#     combined_trajectory.fraction = 1.0 if all_fractions_complete else None
+
+#     return combined_trajectory
+
 
     # def _setup_scrubber(self):
     #     if not self.trajectory or not self.trajectory.points:
