@@ -511,7 +511,6 @@ class TrajectoryPlayer:
         mode_str = "Cached" if getattr(self, 'use_cache', False) else "Live"
         print(f"⏱️ Creating time-based scrubber (Total Time: {total_time:.2f}s, Mode: {mode_str})")
         
-        from compas_threejs.ui import Timeline
         timeline = Timeline(total_time=total_time, step=0.01, value=0.0, action=scrub_callback)
         self.viewer.add_ui_element(timeline)
         
