@@ -365,6 +365,24 @@ class TrajectoryPlayer:
         for mesh in meshes:
             self.viewer.add_geometry(mesh, material=wood_mat)
             self.assembled_objects.append(mesh)
+    
+    def _hide_and_remove(self, obj):
+        """A bulletproof method to remove objects from the Three.js canvas."""
+        if not obj: return
+        
+        # 1. GOLD STANDARD: Use your new direct websocket dispatch via GUID
+        try:
+            self.viewer.remove_object(obj)
+        except Exception:
+            pass
+
+        # 2. FALLBACK: Teleport to the shadow realm
+        try:
+            self.viewer.transform(obj, Translation.from_vector([0, 0, -10000]))
+            if hasattr(obj, 'visible'):
+                obj.visible = False
+        except Exception: 
+            pass
 
     # --------------------------------------------------------------------------
     # Scrubber Logic
