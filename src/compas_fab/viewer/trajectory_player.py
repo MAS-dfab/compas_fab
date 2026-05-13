@@ -247,15 +247,37 @@ class TrajectoryPlayer:
 
         # 4. Add the Gradient Trace
         if draw_trace and len(tcp_points) > 1:
+            self.trace_objects = getattr(self, 'trace_objects', [])
             trace_line = Polyline(tcp_points)
             lines = trace_line.lines
             num_lines = len(lines)
             
             for i, line in enumerate(lines):
-                if line.length < 0.0001:
+                length = line.length
+                if length < 0.0001:
                     continue 
+
+                # 1. Create a thin cylinder (2mm radius) centered at the origin
+                cyl_shape = Cylinder(0.002, length) 
+                trace_mesh = CompasMesh.from_shape(cyl_shape)
+
+                # 2. Mathematically orient the cylinder to perfectly match the line segment
+                z_axis = line.vector.unitized()
+                if abs(z_axis.z) < 0.99:
+                    x_axis = z_axis.cross([0, 0, 1]).unitized()
+                else:
+                    x_axis = z_axis.cross([0, 1, 0]).unitized()
+                y_axis = z_axis.cross(x_axis).unitized()
+
+                target_frame = Frame(line.midpoint, x_axis, y_axis)
+                trace_mesh.transform(Transformation.from_frame(target_frame))
+
+                # 3. Apply your beautiful gradient and send it to the viewer
                 r, g, b = i / num_lines, 0.0, 1.0 - (i / num_lines)
-                self.viewer.add_geometry(line, LineMaterial(color=Color(r, g, b), opacity=0.5))
+                mat = PhysicalMaterial(color=Color(r, g, b))
+                
+                self.viewer.add_geometry(trace_mesh, mat)
+                self.trace_objects.append(trace_mesh)
 
         # 5. Add the Dynamic TCP Triad
         if draw_triad:
@@ -281,7 +303,8 @@ class TrajectoryPlayer:
         if not self.trajectory or not self.trajectory.points:
             print("⚠️ No trajectory points found for ghost!")
             return
-
+        
+        self.ghost_objects = getattr(self, 'ghost_objects', [])
         ghost_mat = Material(color=Color(*color), opacity=opacity)
 
         final_point = self.trajectory.points[-1]
@@ -322,6 +345,7 @@ class TrajectoryPlayer:
                         ghost_tool_mesh.transform(T_final)
                         
                         self.viewer.add_geometry(ghost_tool_mesh, ghost_mat)
+                        self.ghost_objects.append(ghost_mesh)
 
     def _cleanup_previous_run(self):
         """Completely removes old geometries from the Three.js scene."""
