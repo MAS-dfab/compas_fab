@@ -41,6 +41,7 @@ class TrajectoryPlayer:
         self.robot_cell = robot_cell
         self.trajectory = trajectory
         self.cell_state = cell_state or robot_cell.default_cell_state
+        # self.cell_state = robot_cell.default_cell_state
 
         self.use_cache = use_cache
         self.cache_step = 1.0 / cache_fps if cache_fps > 0 else 0.05
