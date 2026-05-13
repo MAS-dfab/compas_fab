@@ -199,6 +199,39 @@ class TrajectoryPlayer:
                     if rb_state.frame:
                         T_world = Transformation.from_frame(rb_state.frame)
                         self.viewer.transform(item, T_world)
+    
+    def _cleanup_previous_run(self):
+        """Completely removes old geometries from the Three.js scene."""
+
+        # 1. REMOVE old assembled elements
+        if hasattr(self, 'assembled_objects'):
+            for mesh in self.assembled_objects:
+                self._hide_and_remove(mesh)
+            self.assembled_objects = []
+                
+        # 2. REMOVE and CLEAR old workpieces
+        if hasattr(self, 'dynamic_workpieces'):
+            for data in self.dynamic_workpieces.values():
+                self._hide_and_remove(data['mesh'])
+            self.dynamic_workpieces = {} 
+                
+        # 3. REMOVE old TCP triad
+        if hasattr(self, 'triad_objects'):
+            for mesh in self.triad_objects:
+                self._hide_and_remove(mesh)
+            self.triad_objects = []
+
+        # 4. REMOVE old traces
+        if hasattr(self, 'trace_objects'):
+            for line in self.trace_objects:
+                self._hide_and_remove(line)
+            self.trace_objects = []
+
+        # 5. REMOVE old ghosts
+        if hasattr(self, 'ghost_objects'):
+            for mesh in self.ghost_objects:
+                self._hide_and_remove(mesh)
+            self.ghost_objects = []
 
     # --------------------------------------------------------------------------
     # Visualisation Helpers
